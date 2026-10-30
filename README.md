@@ -1,5 +1,43 @@
-# Crop-Disease-Detection
-App is Deployed on Heroku Server and can be used for image classification.
+# Agri backend: Disease + Crop recommendation
+
+One Python Flask app with two APIs:
+
+- **Disease (Plant_AI):** POST `/api/predict` – leaf image → crop, disease, confidence  
+- **Crop recommendation (ben041 Random Forest):** POST `/api/crop-predict` – N, P, K, temp, humidity, ph, rainfall → crop  
+
+Next.js uses the same URL for both: set `DISEASE_MODEL_API_URL` and `CROP_MODEL_API_URL` to this app (e.g. `http://localhost:5000`).
+
+## Model files (required)
+
+### 1. Disease (Plant_AI)
+
+1. Go to https://github.com/soumyajit4419/Plant_AI  
+2. Open **Models** and download **plantDisease-resnet34.pth**  
+3. Put it in `temp_disease_model/Models/`  
+
+Expects **128×128** input; predicts **38** classes across **14** plants.
+
+### 2. Crop recommendation (optional)
+
+1. Go to https://github.com/ben041/Soil-Crop-Recommendation-Models  
+2. Copy from **Advance_models/** into `temp_disease_model/Models/`: **RandomForest.pkl**, **label_map.pkl**  
+
+If these are missing, disease API still works; crop suggestion will use rule-based only until the crop model is added.
+
+### 3. Soil (GEE, optional)
+
+Soil quality uses Google Earth Engine (SMAP + MODIS). One-time setup:
+
+1. Install deps: `pip install -r requirements.txt` (includes `earthengine-api`).
+2. Authenticate **using the CLI** (do **not** use `py -m earthengine`):
+   - Run: **`earthengine authenticate`** (the script installed with earthengine-api).
+   - If that command is not found, run from Python: **`py -c "import ee; ee.Authenticate()"`** (opens browser to sign in).
+3. Set a **project**: Earth Engine requires a Google Cloud project ID. Before starting the app, set:
+   - **Windows (cmd):** `set EE_PROJECT=your-project-id`
+   - **Windows (PowerShell):** `$env:EE_PROJECT="your-project-id"`
+   - **Linux/macOS:** `export EE_PROJECT=your-project-id`
+   - Get your project ID from [Google Cloud Console](https://console.cloud.google.com/) (use an existing project or create one; enable Earth Engine API if needed).
+4. Start the app: `python app.py`. Soil API: GET `/api/soil/quality`.
 
 ## Table of Contents
 
@@ -43,6 +81,14 @@ Simple web app is created using flask which is a micro-framework for web app cre
 ### Model Deployment-:
 
 Our Model is deployed on Heroku Server which is easy to integrate by connecting your Github repo to it. Since our Model is Huge and to upload huge files on Github we need to use Gitlfs to deploy our model on github as i have done and when connecting your repository to Heroku do not forget to add Gitlfs buildpack otherwise you will receive error rather than a web app. You can cofigure your repository for Continuos Integration and than you can enble continuous integration on heroku server which will update your app as soon as your repository is updated.
+
+## Running locally
+
+1. Create a virtual environment (recommended): `python -m venv venv`, then `venv\Scripts\activate` (Windows) or `source venv/bin/activate` (macOS/Linux).
+2. Install dependencies: `pip install -r requirements.txt`
+3. Ensure `Models/plantDisease-resnet34.pth` is present (see **Model file** above).
+4. Run the Flask app: `python app.py`
+5. Use the `/api/predict` endpoint (POST with multipart `file` or `image`) for the Next.js Diseases page.
 
 ## Assumptions-:
 Since model is trained for specific crops only so it can diagnose those specific crops only.

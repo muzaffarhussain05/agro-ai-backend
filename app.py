@@ -1,77 +1,224 @@
+# Agri backend: Disease (Plant_AI) + Crop (Random Forest) + Soil (GEE SMAP/MODIS)
+# One backend, three APIs: POST /api/predict, POST /api/crop-predict, GET /api/soil/quality
 
 from __future__ import division, print_function
-import sys
 import os
-import glob
-import re
-import numpy as np
 
-# Keras
-from keras.models import load_model
-from keras.preprocessing import image
-
-# Flask utils
-from flask import Flask, redirect, url_for, request, render_template
+from flask import Flask, request, render_template, jsonify
 from werkzeug.utils import secure_filename
-from gevent.pywsgi import WSGIServer
 
-# Define a flask app
+from model import predict_image, is_likely_leaf
+from crop_predictor import predict_crop, predict_crop_top_k
+
 app = Flask(__name__)
 
-MODEL_PATH = 'Model.hdf5'
+# Allow mobile app and Flutter web to call this API from any origin
+@app.after_request
+def _cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
 
-# Load your trained model
-print(" ** Model Loading **")
-model = load_model(MODEL_PATH)
-print(" ** Model Loaded **")
-model._make_predict_function()
+# GEE: lazy init for soil/water APIs. Run: earthengine authenticate
+# Default project (override with env EE_PROJECT or GEE_PROJECT)
 
-
-
-def model_predict(img_path, model):
-    img = image.load_img(img_path, target_size=(224, 224))
-
-    # Preprocessing the image
-    x = image.img_to_array(img)
-    x = np.expand_dims(x, axis=0)
-
-    x = x/255
-
-    preds = model.predict(x)
-    d = preds.flatten()
-    j = d.max()
-    li=['Apple___Apple_scab', 'Apple___Black_rot', 'Apple___Cedar_apple_rust', 'Apple___healthy', 'Blueberry___healthy', 'Cherry_(including_sour)___Powdery_mildew', 'Cherry_(including_sour)___healthy', 'Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot', 'Corn_(maize)___Common_rust_', 'Corn_(maize)___Northern_Leaf_Blight', 'Corn_(maize)___healthy', 'Grape___Black_rot', 'Grape___Esca_(Black_Measles)', 'Grape___Leaf_blight_(Isariopsis_Leaf_Spot)', 'Grape___healthy', 'Orange___Haunglongbing_(Citrus_greening)', 'Peach___Bacterial_spot', 'Peach___healthy', 'Pepper,_bell___Bacterial_spot', 'Pepper,_bell___healthy', 'Potato___Early_blight', 'Potato___Late_blight', 'Potato___healthy', 'Raspberry___healthy', 'Soybean___healthy', 'Squash___Powdery_mildew', 'Strawberry___Leaf_scorch', 'Strawberry___healthy', 'Tomato___Bacterial_spot', 'Tomato___Early_blight', 'Tomato___Late_blight', 'Tomato___Leaf_Mold', 'Tomato___Septoria_leaf_spot', 'Tomato___Spider_mites Two-spotted_spider_mite', 'Tomato___Target_Spot', 'Tomato___Tomato_Yellow_Leaf_Curl_Virus', 'Tomato___Tomato_mosaic_virus', 'Tomato___healthy']
-    for index,item in enumerate(d):
-        if item == j:
-            class_name = li[index].split('___')
-    return class_name
+_gee_initialized = None
+_gee_error = None
 
 
-@app.route('/')
+def _ensure_gee():
+    """Return (True, None) on success, (False, error_message) on failure."""
+    global _gee_initialized, _gee_error
+    if _gee_initialized is True:
+        return True, None
+    if _gee_initialized is False:
+        return False, (_gee_error or "Earth Engine not initialized. Run: earthengine authenticate")
+    try:
+        import ee
+        project = os.environ.get("EE_PROJECT") or os.environ.get("GEE_PROJECT") or DEFAULT_EE_PROJECT
+        ee.Initialize(project=project)
+        _gee_initialized = True
+        return True, None
+    except Exception as e:
+        _gee_initialized = False
+        _gee_error = str(e).strip() or type(e).__name__
+        if "no project found" in _gee_error.lower():
+            _gee_error = (
+                "Earth Engine needs a project. Set env EE_PROJECT to your Google Cloud project ID "
+                "(e.g. my-project-123). See https://developers.google.com/earth-engine/guides/python_install#authenticate."
+            )
+        print("GEE not initialized:", _gee_error)
+        return False, _gee_error
+
+# Parse "Crop___Disease" from Plant_AI class names into crop and disease
+def parse_class(class_name):
+    parts = class_name.split("___", 1)
+    crop = parts[0].strip() if parts else "Unknown"
+    disease = parts[1].strip().replace("_", " ") if len(parts) > 1 else "Unknown"
+    return crop, disease
+
+
+@app.route("/")
 def index():
-    # Main page
-    return render_template('index.html')
+    return render_template("index.html")
 
 
-@app.route('/predict', methods=['GET', 'POST'])
+@app.route("/predict", methods=["GET", "POST"])
 def upload():
-    if request.method == 'POST':
-        # Get the file from post request
-        f = request.files['file']
-
-        # Save the file to ./uploads
+    if request.method == "POST":
+        f = request.files.get("file")
+        if not f:
+            return jsonify({"error": "No file provided"}), 400
         basepath = os.path.dirname(__file__)
-        file_path = os.path.join(
-            basepath, 'uploads', secure_filename(f.filename))
+        file_path = os.path.join(basepath, "uploads", secure_filename(f.filename))
         f.save(file_path)
-
-        # Make prediction
-        class_name = model_predict(file_path, model)
-
-        result = str(f"Predicted Crop:{class_name[0]}  Predicted Disease:{class_name[1].title().replace('_',' ')}")               
+        with open(file_path, "rb") as fp:
+            img_bytes = fp.read()
+        if not is_likely_leaf(img_bytes):
+            return jsonify({"error": "Please upload a close-up leaf image.", "not_leaf": True}), 400
+        class_name, confidence = predict_image(img_bytes)
+        crop, disease = parse_class(class_name)
+        result = f"Predicted Crop:{crop}  Predicted Disease:{disease}"
         return result
-    return None
+    return ""
 
 
-if __name__ == '__main__':
-    app.run(debug=True)
+@app.route("/api/predict", methods=["POST"])
+def api_predict():
+    """JSON endpoint for Next.js. Expects multipart form 'file' or 'image'."""
+    f = request.files.get("file") or request.files.get("image")
+    if not f:
+        return jsonify({"error": "No file provided. Send multipart field 'file' or 'image'."}), 400
+    basepath = os.path.dirname(__file__)
+    file_path = os.path.join(basepath, "uploads", secure_filename(f.filename or "upload.jpg"))
+    f.save(file_path)
+    try:
+        with open(file_path, "rb") as fp:
+            img_bytes = fp.read()
+        if not is_likely_leaf(img_bytes):
+            return jsonify({
+                "not_leaf": True,
+                "message": "Please upload a close-up leaf image for accurate disease detection.",
+            }), 400
+        class_name, confidence = predict_image(img_bytes)
+        crop, disease = parse_class(class_name)
+        return jsonify({
+            "crop": crop,
+            "disease": disease,
+            "confidence": confidence,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/crop-predict", methods=["POST"])
+def api_crop_predict():
+    """Crop recommendation (ben041 Random Forest). Expects JSON: { N, P, K, temperature, humidity, ph, rainfall }.
+    Returns top 5 crops with confidence: { crop, crops: [ { crop, confidence }, ... ] }."""
+    data = request.get_json(silent=True) or {}
+    try:
+        N = float(data.get("N", 0))
+        P = float(data.get("P", 0))
+        K = float(data.get("K", 0))
+        temperature = float(data.get("temperature", 25))
+        humidity = float(data.get("humidity", 60))
+        ph = float(data.get("ph", 6.5))
+        rainfall = float(data.get("rainfall", 100))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid input. Send N, P, K, temperature, humidity, ph, rainfall as numbers."}), 400
+
+    try:
+        top_k = predict_crop_top_k(N, P, K, temperature, humidity, ph, rainfall, k=5)
+        if not top_k:
+            return jsonify({"error": "Model returned no crops.", "crop": None, "crops": []}), 503
+        top_crop = top_k[0][0]
+        crops = [{"crop": name, "confidence": conf} for name, conf in top_k]
+        return jsonify({"crop": top_crop, "crops": crops})
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 503
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/soil/quality", methods=["GET"])
+def api_soil_quality():
+    """Soil quality from GEE (SMAP + MODIS). GET ?lat=&lng=&buffer_km=2&start_date=&end_date= (YYYY-MM-DD)."""
+    ok, err = _ensure_gee()
+    if not ok:
+        return jsonify({"error": err}), 503
+
+    lat = request.args.get("lat", type=float)
+    lng = request.args.get("lng", type=float)
+    buffer_km = request.args.get("buffer_km", default=2, type=float)
+    start_date = request.args.get("start_date", "").strip()
+    end_date = request.args.get("end_date", "").strip()
+
+    if lat is None or lng is None:
+        return jsonify({"error": "lat and lng are required"}), 400
+    if not start_date or not end_date:
+        return jsonify({"error": "start_date and end_date are required (YYYY-MM-DD)"}), 400
+
+    buffer_km = max(0.5, min(20, buffer_km))
+
+    try:
+        from gee_soil import get_soil_quality_for_area
+        result = get_soil_quality_for_area(lat, lng, buffer_km, start_date, end_date)
+    except Exception as e:
+        print("GEE soil/quality error:", e)
+        return jsonify({"error": str(e)}), 500
+
+    if (
+        result.get("soil_moisture") is None
+        or result.get("ndvi") is None
+        or result.get("ndwi") is None
+        or result.get("lst") is None
+    ):
+        return jsonify({
+            "error": "One or more bands missing (SMAP/MODIS may have no data for this date/area).",
+            "result": result,
+        }), 503
+
+    return jsonify({
+        "soil_moisture": round(result["soil_moisture"], 4),
+        "ndvi": round(result["ndvi"], 4),
+        "ndwi": round(result["ndwi"], 4),
+        "lst": round(result["lst"], 2),
+    })
+
+
+@app.route("/api/water/availability", methods=["GET"])
+def api_water_availability():
+    """Water availability from GEE (GLDAS precip, ET, soil moisture). GET ?lat=&lng=&start_date=&end_date= (YYYY-MM-DD)."""
+    ok, err = _ensure_gee()
+    if not ok:
+        return jsonify({"error": err}), 503
+
+    lat = request.args.get("lat", type=float)
+    lng = request.args.get("lng", type=float)
+    start_date = request.args.get("start_date", "").strip()
+    end_date = request.args.get("end_date", "").strip()
+
+    if lat is None or lng is None:
+        return jsonify({"error": "lat and lng are required"}), 400
+    if not start_date or not end_date:
+        return jsonify({"error": "start_date and end_date are required (YYYY-MM-DD)"}), 400
+
+    try:
+        from gee_water import get_water_availability_timeseries
+        data = get_water_availability_timeseries(lat, lng, start_date, end_date)
+    except Exception as e:
+        print("GEE water/availability error:", e)
+        return jsonify({"error": str(e)}), 500
+
+    if not data:
+        return jsonify({"error": "No GLDAS data for this date/area.", "data": []}), 503
+
+    return jsonify({"data": data})
+
+
+if __name__ == "__main__":
+    # host=0.0.0.0 so Android emulator (10.0.2.2) and other devices on LAN can reach this server
+    # use_reloader=False: Windows watchdog often restarts on site-packages changes (sklearn/ee),
+    # which briefly kills the server and causes "Cannot reach the Python backend" in the UI.
+    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
