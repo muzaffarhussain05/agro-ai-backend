@@ -52,3 +52,4 @@ tzdata==2026.6
 uritemplate==4.2.0
 urllib3==2.8.0
 Werkzeug==3.0.6
+google-auth

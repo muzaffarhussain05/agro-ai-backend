@@ -3,7 +3,9 @@
 
 from __future__ import division, print_function
 import os
-
+import json
+import ee
+from google.oauth2 import service_account
 from flask import Flask, request, render_template, jsonify
 from werkzeug.utils import secure_filename
 
@@ -26,34 +28,55 @@ _gee_error = None
 
 
 def _ensure_gee():
-    """Return (True, None) on success, (False, error_message) on failure."""
     global _gee_initialized, _gee_error
     if _gee_initialized is True:
         return True, None
     if _gee_initialized is False:
         return False, (_gee_error or "Earth Engine not initialized. Run: earthengine authenticate")
+
     try:
+        import json
         import ee
+        from google.oauth2 import service_account
+
+        scopes = [
+            "https://www.googleapis.com/auth/earthengine",
+            "https://www.googleapis.com/auth/cloud-platform",
+        ]
+
+        key_path = os.environ.get("EE_SERVICE_ACCOUNT_FILE")
+        key_json = os.environ.get("EE_SERVICE_ACCOUNT_JSON")
+
+        if key_path and os.path.isfile(key_path):
+            credentials = service_account.Credentials.from_service_account_file(
+                key_path, scopes=scopes
+            )
+        elif key_json:
+            credentials = service_account.Credentials.from_service_account_info(
+                json.loads(key_json), scopes=scopes
+            )
+        else:
+            _gee_initialized = False
+            _gee_error = (
+                "No service account configured. Set EE_SERVICE_ACCOUNT_FILE "
+                "(local JSON path) or EE_SERVICE_ACCOUNT_JSON (JSON string)."
+            )
+            return False, _gee_error
+
         project = os.environ.get("EE_PROJECT") or os.environ.get("GEE_PROJECT")
         if not project:
             _gee_initialized = False
             _gee_error = "EE_PROJECT env var not set. Set it to your Google Cloud project ID."
             return False, _gee_error
-        ee.Initialize(project=project)
+
+        ee.Initialize(credentials=credentials, project=project)
         _gee_initialized = True
         return True, None
     except Exception as e:
         _gee_initialized = False
         _gee_error = str(e).strip() or type(e).__name__
-        if "no project found" in _gee_error.lower():
-            _gee_error = (
-                "Earth Engine needs a project. Set env EE_PROJECT to your Google Cloud project ID "
-                "(e.g. my-project-123). See https://developers.google.com/earth-engine/guides/python_install#authenticate."
-            )
-        print("GEE not initialized:", _gee_error)
+        print("GEE init failed:", _gee_error)
         return False, _gee_error
-
-
 def parse_class(class_name):
     parts = class_name.split("___", 1)
     crop = parts[0].strip() if parts else "Unknown"
