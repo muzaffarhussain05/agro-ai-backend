@@ -137,27 +137,90 @@ def get_modis_ndwi_mean(region: ee.Geometry, start_date: str, end_date: str) -> 
     return None
 
 
-def get_modis_lst_mean(region: ee.Geometry, start_date: str, end_date: str) -> float | None:
-    """MODIS Terra MOD21A1D: LST_1KM, scale 0.02, Kelvin → Celsius."""
+
+
+def get_modis_lst_mean(region, start_date, end_date):
     try:
-        col = ee.ImageCollection("MODIS/061/MOD21A1D").filterDate(start_date, end_date)
-        img = col.mean()
-        reduced = img.reduceRegion(
+        collection = (
+            ee.ImageCollection("MODIS/061/MOD21A1D")
+            .filterDate(start_date, end_date)
+            .select(["LST_1KM", "QC"])
+        )
+
+        image_count = collection.size().getInfo()
+        print(f"MODIS LST images: {image_count}")
+
+        if image_count == 0:
+            print("No MODIS LST images found for this date range.")
+            return None
+
+        def prepare_lst(image):
+            qc = image.select("QC")
+
+            # Bits 0-1: Mandatory QA (0 = good, 1 = nominal)
+            mandatory_qa = qc.bitwiseAnd(3).lte(1)
+
+            # Bits 2-3: Data quality (0 = good)
+            data_quality = qc.rightShift(2).bitwiseAnd(3).eq(0)
+
+            # Bits 4-5: Cloud flag (0 = clear, 1 = thin cirrus)
+            cloud_quality = qc.rightShift(4).bitwiseAnd(3).lte(1)
+
+            quality_mask = (
+                mandatory_qa
+                .And(data_quality)
+                .And(cloud_quality)
+            )
+
+            # Earth Engine has already applied the scale factor.
+            lst_celsius = (
+                image.select("LST_1KM")
+                .updateMask(quality_mask)
+                .subtract(273.15)
+                .rename("lst_c")
+            )
+
+            return lst_celsius
+
+        lst_collection = collection.map(prepare_lst)
+        temporal_mean = lst_collection.mean()
+
+        stats = temporal_mean.reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=region,
             scale=1000,
             maxPixels=1e9,
+            bestEffort=True
         )
-        info = reduced.getInfo()
-        if not info:
+
+        pixel_stats = temporal_mean.reduceRegion(
+            reducer=ee.Reducer.count(),
+            geometry=region,
+            scale=1000,
+            maxPixels=1e9,
+            bestEffort=True
+        )
+
+        stats_info = stats.getInfo()
+        pixel_info = pixel_stats.getInfo()
+
+        value = stats_info.get("lst_c")
+        valid_pixels = pixel_info.get("lst_c", 0)
+
+        print(f"MODIS LST result: {value}")
+        print(f"MODIS LST valid pixels: {valid_pixels}")
+
+        if value is None or valid_pixels == 0:
+            print("No valid LST pixels after quality masking.")
             return None
-        val = info.get("LST_1KM") or info.get("LST_Day_1km")
-        if val is not None:
-            kelvin = float(val) * 0.02
-            return kelvin - 273.15
+
+        return round(float(value), 2)
+
+    except Exception as e:
+        print(f"MODIS LST error: {e}")
         return None
-    except Exception:
-        return None
+
+
 
 
 def get_soil_quality_for_area(
@@ -177,6 +240,12 @@ def get_soil_quality_for_area(
     ndvi = get_modis_ndvi_mean(region, start_date, end_date)
     ndwi = get_modis_ndwi_mean(region, start_date, end_date)
     lst = get_modis_lst_mean(region, start_date, end_date)
+    print("\n========== SOIL REQUEST ==========")
+    print(f"Latitude: {lat}")
+    print(f"Longitude: {lng}")
+    print(f"Buffer: {buffer_km} km")
+    print(f"Dates: {start_date} - {end_date}")
+    print("==================================")
 
     def clamp_sm(v):
         if v is None:
