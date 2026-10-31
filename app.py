@@ -20,8 +20,6 @@ def _cors(resp):
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return resp
 
-# GEE: lazy init for soil/water APIs. Run: earthengine authenticate
-# Default project (override with env EE_PROJECT or GEE_PROJECT)
 
 _gee_initialized = None
 _gee_error = None
@@ -36,7 +34,11 @@ def _ensure_gee():
         return False, (_gee_error or "Earth Engine not initialized. Run: earthengine authenticate")
     try:
         import ee
-        project = os.environ.get("EE_PROJECT") or os.environ.get("GEE_PROJECT") or DEFAULT_EE_PROJECT
+        project = os.environ.get("EE_PROJECT") or os.environ.get("GEE_PROJECT")
+        if not project:
+            _gee_initialized = False
+            _gee_error = "EE_PROJECT env var not set. Set it to your Google Cloud project ID."
+            return False, _gee_error
         ee.Initialize(project=project)
         _gee_initialized = True
         return True, None
@@ -51,7 +53,7 @@ def _ensure_gee():
         print("GEE not initialized:", _gee_error)
         return False, _gee_error
 
-# Parse "Crop___Disease" from Plant_AI class names into crop and disease
+
 def parse_class(class_name):
     parts = class_name.split("___", 1)
     crop = parts[0].strip() if parts else "Unknown"
@@ -114,8 +116,7 @@ def api_predict():
 
 @app.route("/api/crop-predict", methods=["POST"])
 def api_crop_predict():
-    """Crop recommendation (ben041 Random Forest). Expects JSON: { N, P, K, temperature, humidity, ph, rainfall }.
-    Returns top 5 crops with confidence: { crop, crops: [ { crop, confidence }, ... ] }."""
+    """Crop recommendation (ben041 Random Forest). Expects JSON: { N, P, K, temperature, humidity, ph, rainfall }."""
     data = request.get_json(silent=True) or {}
     try:
         N = float(data.get("N", 0))
@@ -168,28 +169,32 @@ def api_soil_quality():
         print("GEE soil/quality error:", e)
         return jsonify({"error": str(e)}), 500
 
-    if (
-        result.get("soil_moisture") is None
-        or result.get("ndvi") is None
-        or result.get("ndwi") is None
-        or result.get("lst") is None
-    ):
+    missing = [k for k, v in result.items() if v is None]
+
+    if len(missing) == 4:
         return jsonify({
-            "error": "One or more bands missing (SMAP/MODIS may have no data for this date/area).",
+            "error": "No soil data for this area/date range. Try a different location or a wider date window.",
             "result": result,
         }), 503
 
-    return jsonify({
-        "soil_moisture": round(result["soil_moisture"], 4),
-        "ndvi": round(result["ndvi"], 4),
-        "ndwi": round(result["ndwi"], 4),
-        "lst": round(result["lst"], 2),
-    })
+    response = {}
+    if result.get("soil_moisture") is not None:
+        response["soil_moisture"] = round(result["soil_moisture"], 4)
+    if result.get("ndvi") is not None:
+        response["ndvi"] = round(result["ndvi"], 4)
+    if result.get("ndwi") is not None:
+        response["ndwi"] = round(result["ndwi"], 4)
+    if result.get("lst") is not None:
+        response["lst"] = round(result["lst"], 2)
+    if missing:
+        response["missingBands"] = missing
+
+    return jsonify(response), 200
 
 
 @app.route("/api/water/availability", methods=["GET"])
 def api_water_availability():
-    """Water availability from GEE (GLDAS precip, ET, soil moisture). GET ?lat=&lng=&start_date=&end_date= (YYYY-MM-DD)."""
+    """Water availability from GEE (GLDAS). GET ?lat=&lng=&start_date=&end_date= (YYYY-MM-DD)."""
     ok, err = _ensure_gee()
     if not ok:
         return jsonify({"error": err}), 503
@@ -217,8 +222,25 @@ def api_water_availability():
     return jsonify({"data": data})
 
 
+def _warmup_gee():
+    """Warm up GEE by running a tiny compute on startup (eliminates 16s first-call penalty)."""
+    ok, err = _ensure_gee()
+    if not ok:
+        print(f"[warmup] GEE not ready: {err}")
+        return
+    try:
+        import ee
+        ee.Image(1).reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=ee.Geometry.Point([0, 0]),
+            scale=1000,
+        ).getInfo()
+        print("[warmup] GEE warmed up successfully")
+    except Exception as e:
+        print(f"[warmup] GEE warmup failed (non-fatal): {e}")
+
+
 if __name__ == "__main__":
-    # host=0.0.0.0 so Android emulator (10.0.2.2) and other devices on LAN can reach this server
-    # use_reloader=False: Windows watchdog often restarts on site-packages changes (sklearn/ee),
-    # which briefly kills the server and causes "Cannot reach the Python backend" in the UI.
-    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+    import threading
+    threading.Thread(target=_warmup_gee, daemon=True).start()
+    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False, threaded=True)
