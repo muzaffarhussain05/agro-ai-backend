@@ -4,15 +4,24 @@
 from __future__ import division, print_function
 import os
 import json
+import asyncio
+import logging
+from pathlib import Path
+from dotenv import load_dotenv
+
 import ee
-from google.oauth2 import service_account
 from flask import Flask, request, render_template, jsonify
 from werkzeug.utils import secure_filename
 
 from model import predict_image, is_likely_leaf
 from crop_predictor import predict_crop, predict_crop_top_k
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+load_dotenv()
+
 app = Flask(__name__)
+
 
 # Allow mobile app and Flutter web to call this API from any origin
 @app.after_request
@@ -23,65 +32,178 @@ def _cors(resp):
     return resp
 
 
-_gee_initialized = None
-_gee_error = None
+# ---------------------------------------------------------------------------
+# Earth Engine initialization
+# Mirrors the WeatherNow (FastAPI) app:
+#   - reads EE_PROJECT_ID / EE_SERVICE_ACCOUNT_FILE (and legacy vars as fallback)
+#   - resolves the service-account JSON path
+#   - validates the key file
+#   - initializes ee with ServiceAccountCredentials
+#   - verifies with a real computation
+#   - retries in a background thread until success
+# ---------------------------------------------------------------------------
+
+ee_initialized = False
+initialization_error = None
+
+EE_RETRY_INTERVAL = 60  # seconds
+
+
+def _resolve_project_id():
+    return (
+        os.environ.get("EE_PROJECT_ID", "").strip()
+        or os.environ.get("EE_PROJECT", "").strip()
+        or os.environ.get("GEE_PROJECT", "").strip()
+    )
+
+
+def _resolve_key_path():
+    key_file = os.environ.get("EE_SERVICE_ACCOUNT_FILE", "").strip()
+    if not key_file:
+        return None
+    key_path = Path(key_file).expanduser()
+    if not key_path.is_absolute():
+        key_path = Path(__file__).resolve().parent / key_path
+    return key_path.resolve()
+
+
+def initialize_earth_engine():
+    """Same initialization contract as the WeatherNow FastAPI app."""
+    global ee_initialized, initialization_error
+
+    try:
+        project_id = _resolve_project_id()
+        if not project_id:
+            raise RuntimeError("EE_PROJECT_ID is missing from environment")
+
+        key_path = _resolve_key_path()
+        if not key_path:
+            raise RuntimeError(
+                "EE_SERVICE_ACCOUNT_FILE is missing from environment"
+            )
+
+        if not key_path.is_file():
+            raise FileNotFoundError(
+                f"Service-account JSON not found: {key_path}"
+            )
+
+        with key_path.open("r", encoding="utf-8") as file:
+            key_data = json.load(file)
+
+        if key_data.get("type") != "service_account":
+            raise ValueError("The JSON file is not a service-account key")
+
+        email = key_data.get("client_email")
+        if not email:
+            raise ValueError("Missing client_email in service-account JSON")
+
+        credentials = ee.ServiceAccountCredentials(email, str(key_path))
+        ee.Initialize(credentials, project=project_id)
+
+        # Confirm authentication with a real EE computation.
+        result = ee.Number(1).add(1).getInfo()
+        if result != 2:
+            raise RuntimeError("Earth Engine authentication test failed")
+
+        ee_initialized = True
+        initialization_error = None
+        logger.info(
+            "Earth Engine initialized successfully using service account."
+        )
+
+    except Exception as exc:
+        ee_initialized = False
+        initialization_error = str(exc)
+        logger.exception("Earth Engine initialization failed.")
+
+
+def earth_engine_retry_worker():
+    """Background retry loop — runs until EE is initialized (like weather app)."""
+    while not ee_initialized:
+        logger.info("Attempting to initialize Google Earth Engine...")
+        initialize_earth_engine()
+
+        if ee_initialized:
+            logger.info("Earth Engine is ready.")
+            return
+
+        logger.warning(
+            "Earth Engine is unavailable. Retrying in %s seconds. "
+            "Backend remains running.",
+            EE_RETRY_INTERVAL,
+        )
+        # Use time.sleep here (thread, not async).
+        import time
+        time.sleep(EE_RETRY_INTERVAL)
 
 
 def _ensure_gee():
-    global _gee_initialized, _gee_error
-    if _gee_initialized is True:
+    """Kept for compatibility with existing soil/water endpoints."""
+    if ee_initialized:
         return True, None
-    if _gee_initialized is False:
-        return False, (_gee_error or "Earth Engine not initialized. Run: earthengine authenticate")
-
-    try:
-        import json
-        import ee
-        from google.oauth2 import service_account
-
-        scopes = [
-            "https://www.googleapis.com/auth/earthengine",
-            "https://www.googleapis.com/auth/cloud-platform",
-        ]
-
-        key_path = os.environ.get("EE_SERVICE_ACCOUNT_FILE")
-        key_json = os.environ.get("EE_SERVICE_ACCOUNT_JSON")
-
-        if key_path and os.path.isfile(key_path):
-            credentials = service_account.Credentials.from_service_account_file(
-                key_path, scopes=scopes
-            )
-        elif key_json:
-            credentials = service_account.Credentials.from_service_account_info(
-                json.loads(key_json), scopes=scopes
-            )
-        else:
-            _gee_initialized = False
-            _gee_error = (
-                "No service account configured. Set EE_SERVICE_ACCOUNT_FILE "
-                "(local JSON path) or EE_SERVICE_ACCOUNT_JSON (JSON string)."
-            )
-            return False, _gee_error
-
-        project = os.environ.get("EE_PROJECT") or os.environ.get("GEE_PROJECT")
-        if not project:
-            _gee_initialized = False
-            _gee_error = "EE_PROJECT env var not set. Set it to your Google Cloud project ID."
-            return False, _gee_error
-
-        ee.Initialize(credentials=credentials, project=project)
-        _gee_initialized = True
+    if initialization_error:
+        return False, initialization_error
+    # Trigger a synchronous init attempt on first use.
+    initialize_earth_engine()
+    if ee_initialized:
         return True, None
-    except Exception as e:
-        _gee_initialized = False
-        _gee_error = str(e).strip() or type(e).__name__
-        print("GEE init failed:", _gee_error)
-        return False, _gee_error
+    return False, (
+        initialization_error
+        or "Earth Engine not initialized. Check EE_PROJECT_ID and "
+        "EE_SERVICE_ACCOUNT_FILE environment variables."
+    )
+
+
 def parse_class(class_name):
     parts = class_name.split("___", 1)
     crop = parts[0].strip() if parts else "Unknown"
     disease = parts[1].strip().replace("_", " ") if len(parts) > 1 else "Unknown"
     return crop, disease
+
+
+# ---------------------------------------------------------------------------
+# Health / reconnect endpoints (parity with WeatherNow)
+# ---------------------------------------------------------------------------
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "earth_engine_initialized": ee_initialized,
+        "initialization_error": initialization_error,
+    })
+
+
+@app.route("/api/earth/reconnect", methods=["POST"])
+def reconnect_earth_engine():
+    global ee_initialized, initialization_error
+
+    if ee_initialized:
+        return jsonify({
+            "success": True,
+            "connected": True,
+            "message": "Earth Engine is already connected.",
+        })
+
+    initialize_earth_engine()
+
+    if ee_initialized:
+        logger.info("Earth Engine reconnected through API.")
+        return jsonify({
+            "success": True,
+            "connected": True,
+            "message": "Earth Engine connected successfully.",
+        })
+
+    logger.warning(
+        "Manual Earth Engine reconnection failed: %s", initialization_error
+    )
+    return jsonify({
+        "success": False,
+        "connected": False,
+        "message": "Earth Engine connection failed.",
+        "error": initialization_error,
+    }), 503
 
 
 @app.route("/")
@@ -245,25 +367,10 @@ def api_water_availability():
     return jsonify({"data": data})
 
 
-def _warmup_gee():
-    """Warm up GEE by running a tiny compute on startup (eliminates 16s first-call penalty)."""
-    ok, err = _ensure_gee()
-    if not ok:
-        print(f"[warmup] GEE not ready: {err}")
-        return
-    try:
-        import ee
-        ee.Image(1).reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=ee.Geometry.Point([0, 0]),
-            scale=1000,
-        ).getInfo()
-        print("[warmup] GEE warmed up successfully")
-    except Exception as e:
-        print(f"[warmup] GEE warmup failed (non-fatal): {e}")
-
-
 if __name__ == "__main__":
     import threading
-    threading.Thread(target=_warmup_gee, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False, threaded=True)
+
+    # Start the same background retry worker as the weather app.
+    threading.Thread(target=earth_engine_retry_worker, daemon=True).start()
+
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False, threaded=True)
